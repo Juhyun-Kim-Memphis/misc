@@ -60,6 +60,12 @@ Optional env vars
 -----------------
     OP                  Operation to benchmark; default `rm`. Future:
                         `cp`, `rsync`. Unknown values fail fast.
+    EXPECTED_NFS_SERVER NFS server (left of `:` in /proc/mounts) that the
+                        mount must come from. When set, the script aborts
+                        before setup if the actual mount source disagrees.
+                        Added after VES-2106 06-12 run measured a phantom
+                        share on the decommissioned 2-DSX Anvil because a
+                        stale csi-node pod was caching the old endpoint.
     BENCH_WORKSHEET     Worksheet/tab name (default: "hstk").
                         Auto-created if missing.
     BENCH_N_FILES       Override total file count (default: from SET_LABEL).
@@ -131,23 +137,54 @@ def parse_sheet_id(url_or_id: str) -> str:
     return m.group(1) if m else url_or_id
 
 
-def get_fstype(path: Path) -> str:
-    """Walk /proc/mounts to find the fstype of the mount containing `path`."""
+def get_mount_info(path: Path) -> tuple[str, str]:
+    """Return (source, fstype) for the longest-prefix mount containing `path`.
+
+    `source` is the device column of /proc/mounts (e.g. `10.197.20.100:/csi-pvc-...`
+    for NFS). Empty strings if no entry matches.
+    """
     target = str(path.resolve())
-    best_mp, best_fs = "", ""
+    best_mp, best_src, best_fs = "", "", ""
     try:
         with open("/proc/mounts") as f:
             for line in f:
                 parts = line.split()
                 if len(parts) < 3:
                     continue
-                mp, fstype = parts[1], parts[2]
+                src, mp, fstype = parts[0], parts[1], parts[2]
                 if target == mp or target.startswith(mp.rstrip("/") + "/"):
                     if len(mp) > len(best_mp):
-                        best_mp, best_fs = mp, fstype
+                        best_mp, best_src, best_fs = mp, src, fstype
     except OSError:
         pass
-    return best_fs
+    return best_src, best_fs
+
+
+def get_fstype(path: Path) -> str:
+    return get_mount_info(path)[1]
+
+
+def assert_nfs_server(path: Path, expected_server: str) -> None:
+    """Fail fast if `path` is not mounted from `expected_server`.
+
+    Guards against the VES-2106 06-12 bench-day pitfall: the Hammerspace CSI
+    plugin pods capture HS_ENDPOINT from a Secret via `env: secretKeyRef` at
+    pod start; secret rotations don't propagate, so a stale csi-node pod can
+    silently mount a PVC from the previous (decommissioned) Anvil instead of
+    the intended one. This check pins the actual NFS server (left of `:` in
+    /proc/mounts) before any measurement runs.
+    """
+    src, _ = get_mount_info(path)
+    if not src:
+        raise RuntimeError(f"{path}: no mount entry in /proc/mounts")
+    actual_server = src.split(":", 1)[0] if ":" in src else src
+    if actual_server != expected_server:
+        raise RuntimeError(
+            f"{path}: mounted from {actual_server!r} (full src={src!r}), "
+            f"expected {expected_server!r}. Likely stale CSI endpoint cache "
+            f"or PVC bound to a phantom share — restart csi-provisioner and "
+            f"csi-node DaemonSet, then recreate the PVC."
+        )
 
 
 # ── Setup: create n_files spread across n_dirs ────────────────────────────
@@ -383,12 +420,17 @@ def main() -> int:
         ws = open_sheet(sheet_id, worksheet_name, sa_json)
         print("[init] sheet ready")
 
-    fstype = get_fstype(mount_path)
+    expected_server = env("EXPECTED_NFS_SERVER")
+    if expected_server:
+        assert_nfs_server(mount_path, expected_server)
+
+    mount_src, fstype = get_mount_info(mount_path)
     config = {
         "timestamp_utc": utc_iso(),
         "scenario": scenario,
         "storageclass": storageclass,
         "fstype": fstype,
+        "mount_src": mount_src,
         "op": op,
         "op_variant": op_variant,
         "set_label": set_label,
@@ -406,6 +448,7 @@ def main() -> int:
     print("=" * 72)
     print(f"  scenario     : {scenario}")
     print(f"  storageclass : {storageclass}  (fstype={fstype})")
+    print(f"  mount_src    : {mount_src or '(not found in /proc/mounts)'}")
     print(f"  op / variant : {op} / {op_variant}")
     print(f"  set_label    : {set_label}  "
           f"({n_files} files in {n_dirs} dirs, {file_size}B each)")

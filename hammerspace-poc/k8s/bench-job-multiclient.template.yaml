@@ -1,0 +1,130 @@
+# Multi-client file-IO benchmark Job for the Hammerspace PoC.
+#
+# Runs `fileio-multiclient-benchmark.py` from the misc public repo
+# (canonical home of the benchmark scripts) on N pods in parallel.
+# Each pod mounts the same RWX PVC; the pods coordinate via file-based
+# barriers under `<mount>/__mc_bench__/<MC_RUN_ID>/` so they all measure
+# concurrently. Index 0 (leader) aggregates per-client results and
+# appends one row to the Google Sheet's `fileio-multi` worksheet.
+#
+# Substitution placeholders (replaced by ./apply-bench-job-multiclient.sh):
+#   __JOB_NAME__       - timestamped Job name (DNS-1123; <= 63 chars)
+#   __PVC_NAME__       - RWX PVC to mount at /mnt/hs (must exist in `default` ns)
+#   __STORAGECLASS__   - StorageClass name of the PVC; recorded as the
+#                        primary experiment identifier in the Sheet row.
+#   __NUM_CLIENTS__    - parallelism = completions; identifies the experiment's
+#                        operative variable (the whole point of the Job).
+#   __MC_RUN_ID__      - identical across all pods of one Job; used in the
+#                        coord directory path so concurrent Jobs (or
+#                        re-runs after a failed batch) don't collide.
+#
+# What runs in each pod (`fileio-multiclient-benchmark.py` does the rest):
+#   1. `gh repo clone Juhyun-Kim-Memphis/misc /work/repo`
+#   2. `python3 -u hammerspace-poc/fileio-multiclient-benchmark.py /mnt/hs`
+#
+# Coordination details: see the script's module docstring (`Phases`).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: __JOB_NAME__
+  namespace: default
+  labels:
+    app: fileio-multiclient-bench
+    run-id: "__MC_RUN_ID__"
+spec:
+  # Indexed Job: each pod gets a stable JOB_COMPLETION_INDEX env (0..N-1),
+  # which the script uses to pick leader (=0) vs follower (>0).
+  completionMode: Indexed
+  parallelism: __NUM_CLIENTS__
+  completions: __NUM_CLIENTS__
+  backoffLimit: 0
+  # 10 clients × ~90s measurement + barrier wait + leader aggregation; give
+  # plenty of room for larger N too.
+  activeDeadlineSeconds: 1800
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: fileio-multiclient-bench
+        job-name: __JOB_NAME__
+        run-id: "__MC_RUN_ID__"
+    spec:
+      restartPolicy: Never
+      # Spread pods across distinct nodes when possible — that's the entire
+      # point of the multi-client experiment (each NFS client on its own
+      # host). `preferred`, not `required`, so the Job still schedules when
+      # N exceeds the number of nodes.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: fileio-multiclient-bench
+                    job-name: __JOB_NAME__
+      containers:
+        - name: bench
+          image: quay.io/vessl-ai/public-images:benchmark-env-ubuntu-22.04
+          imagePullPolicy: IfNotPresent
+          workingDir: /work
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              echo "[$(date -u +%FT%TZ)] node=${NODE_NAME:-?} pod=$(hostname) index=${JOB_COMPLETION_INDEX:-?}/${NUM_CLIENTS}"
+              echo "[$(date -u +%FT%TZ)] cloning Juhyun-Kim-Memphis/misc"
+              export GH_TOKEN="$GITHUB_TOKEN"
+              gh repo clone Juhyun-Kim-Memphis/misc /work/repo
+              cd /work/repo
+              echo "[$(date -u +%FT%TZ)] HEAD = $(git rev-parse --short HEAD)"
+              echo "[$(date -u +%FT%TZ)] launching fileio-multiclient-benchmark.py"
+              exec python3 -u hammerspace-poc/fileio-multiclient-benchmark.py /mnt/hs
+          env:
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hammerspace-test-secret
+                  key: GITHUB_TOKEN
+            - name: SCENARIO
+              value: hammerspace-poc-multiclient
+            - name: STORAGECLASS
+              value: __STORAGECLASS__
+            - name: NUM_CLIENTS
+              value: "__NUM_CLIENTS__"
+            - name: MC_RUN_ID
+              value: "__MC_RUN_ID__"
+            - name: BENCH_SHEET_URL
+              value: "https://docs.google.com/spreadsheets/d/1hOV8q1mDqrlFOEzbTBKUHkhu9-ciZWhTyZFJTqnQuFY/edit"
+            - name: BENCH_WORKSHEET
+              value: fileio-multi
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: /etc/gcp/sheet_bot_sa.json
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          volumeMounts:
+            - name: hs-pvc
+              mountPath: /mnt/hs
+            - name: gcp-sa
+              mountPath: /etc/gcp
+              readOnly: true
+      volumes:
+        - name: hs-pvc
+          persistentVolumeClaim:
+            claimName: __PVC_NAME__
+        - name: gcp-sa
+          secret:
+            secretName: hammerspace-test-secret
+            items:
+              - key: sheet_bot_sa.json
+                path: sheet_bot_sa.json
